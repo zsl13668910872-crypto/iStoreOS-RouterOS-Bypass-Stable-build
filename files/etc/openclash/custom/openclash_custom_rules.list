@@ -1,0 +1,5 @@
+rules:
+- DOMAIN-SUFFIX,hidns.vip,DIRECT
+- DOMAIN-SUFFIX,cmliussss.com,DIRECT
+- DOMAIN-SUFFIX,090227.xyz,DIRECT
+- DOMAIN,tvbbox.pgjgr.eu.cc,DIRECT

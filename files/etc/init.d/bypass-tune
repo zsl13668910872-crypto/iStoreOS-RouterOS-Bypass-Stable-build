@@ -1,0 +1,30 @@
+#!/bin/sh /etc/rc.common
+START=95
+STOP=05
+USE_PROCD=0
+
+start() {
+  # sysctl 服务早于内核模块加载，nf_conntrack/BBR 相关键此时可能还不存在，这里重新应用
+  sysctl -e -q -p /etc/sysctl.d/98-bypass-tune.conf >/dev/null 2>&1 || true
+
+  if [ -f /etc/routeros-bypass/bbr ]; then
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    case " $avail " in
+      *" bbr "*)
+        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+        logger -t bypass-tune "BBR enabled" ;;
+      *) logger -t bypass-tune "BBR not available in this kernel; keeping default" ;;
+    esac
+  fi
+
+  mem_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 2048)
+  if [ "$mem_mb" -ge 6144 ]; then max=262144
+  elif [ "$mem_mb" -ge 3072 ]; then max=131072
+  else max=65536; fi
+  sysctl -w "net.netfilter.nf_conntrack_max=$max" >/dev/null 2>&1 || true
+  logger -t bypass-tune "baseline loaded; conntrack_max=$max"
+  /usr/bin/bypass-apply apply >/dev/null 2>&1 || true
+}
+
+stop() { :; }

@@ -1,0 +1,79 @@
+#!/bin/sh
+# 健康检查（由 cron 每 5 分钟调用）。
+# 只在“Mihomo 进程消失”或“本地 DNS 链连续 2 次探测失败”时才重启 OpenClash，且 15 分钟冷却，
+# 避免远端站点故障导致的重启风暴（会打断在播视频）。远端可用性只记录，不触发任何重启。
+set -u
+TAG=bypass-health
+LOCK=/var/run/bypass-health.lock
+LOG=/var/log/bypass-health.log
+FAIL=/tmp/bypass-health.fail
+COOL=/tmp/bypass-health.cooldown
+MAX=5242880
+
+mkdir "$LOCK" 2>/dev/null || exit 0
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
+log() {
+  logger -t "$TAG" -- "$*"
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+  [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$MAX" ] && tail -c 2621440 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+}
+
+uci -q get openclash.config >/dev/null 2>&1 || exit 0
+[ "$(uci -q get openclash.config.enable 2>/dev/null || echo 0)" = "1" ] || exit 0
+
+yaml_found=0
+for f in /etc/openclash/config/*.yaml /etc/openclash/config/*.yml; do
+  [ -s "$f" ] && yaml_found=1 && break
+done
+[ "$yaml_found" -eq 1 ] || exit 0
+
+now="$(date +%s)"
+in_cooldown=0
+if [ -f "$COOL" ]; then
+  last="$(cat "$COOL" 2>/dev/null || echo 0)"
+  [ $((now - last)) -lt 900 ] && in_cooldown=1
+fi
+
+restart_openclash() {
+  if [ "$in_cooldown" -eq 1 ]; then log "$1 (冷却中，跳过重启)"; return 0; fi
+  log "$1 -> restarting OpenClash"
+  /etc/init.d/openclash restart >/dev/null 2>&1 || true
+  echo "$now" > "$COOL"
+  sleep 5
+}
+
+if ! pgrep -f 'clash_meta|mihomo' >/dev/null 2>&1; then
+  restart_openclash "Mihomo core process absent"
+  exit 0
+fi
+
+# 本地 DNS 链探针：收到任何应答(含 NXDOMAIN)即视为链路正常；只有超时/拒绝才算故障
+probe_ok=1
+if command -v nslookup >/dev/null 2>&1; then
+  out="$(timeout 6 nslookup www.baidu.com 127.0.0.1 2>&1 || true)"
+  case "$out" in
+    *"Address"*|*"NXDOMAIN"*|*"can't resolve"*) probe_ok=1 ;;
+    *) probe_ok=0 ;;
+  esac
+fi
+
+if [ "$probe_ok" -eq 0 ]; then
+  n=0; [ -f "$FAIL" ] && n="$(cat "$FAIL" 2>/dev/null || echo 0)"
+  n=$((n + 1)); echo "$n" > "$FAIL"
+  log "Local DNS probe failed (${n} consecutive)"
+  if [ "$n" -ge 2 ]; then
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    restart_openclash "Local DNS chain broken"
+    echo 0 > "$FAIL"
+  fi
+else
+  echo 0 > "$FAIL"
+fi
+
+if command -v curl >/dev/null 2>&1; then
+  curl -4 -fsS -I --max-time 8 https://tvbbox.pgjgr.eu.cc/ >/dev/null 2>&1 \
+    && log "OKTV remote HTTPS check: PASS" || log "OKTV remote HTTPS check: FAIL (observation only)"
+  curl -4 -fsS --max-time 8 https://www.gstatic.com/generate_204 >/dev/null 2>&1 \
+    && log "Google 204 check: PASS" || log "Google 204 check: FAIL (observation only)"
+fi

@@ -1,0 +1,43 @@
+#!/bin/sh
+# 首次开机一次性执行；幂等；只有构建时填写了 LAN 参数才改 LAN IP/网关
+set -u
+[ -f /etc/routeros-bypass/lan.conf ] && . /etc/routeros-bypass/lan.conf
+LAN_IP="${LAN_IP:-}"; LAN_MASK="${LAN_MASK:-255.255.255.0}"; LAN_GW="${LAN_GW:-}"
+
+if [ -n "$LAN_IP" ] && uci -q get network.lan >/dev/null 2>&1; then
+  uci set network.lan.proto='static'
+  uci set network.lan.ipaddr="$LAN_IP"
+  uci set network.lan.netmask="$LAN_MASK"
+  if [ -n "$LAN_GW" ]; then
+    uci set network.lan.gateway="$LAN_GW"
+    uci -q delete network.lan.dns
+    uci add_list network.lan.dns="$LAN_GW"
+  fi
+  uci -q delete network.lan.ip6assign
+fi
+
+# 多核 x86：软件包转向(packet steering)把软中断分散到各 CPU；单核无影响
+if uci -q get network.globals >/dev/null 2>&1; then
+  uci set network.globals.packet_steering='1'
+fi
+uci commit network 2>/dev/null || true
+
+if [ -x /usr/bin/bypass-apply ]; then /usr/bin/bypass-apply apply >/dev/null 2>&1 || true; fi
+
+if uci -q get openclash.config >/dev/null 2>&1; then
+  if [ -x /etc/openclash/core/clash_meta ]; then
+    uci set openclash.config.core_type='Meta' 2>/dev/null || true
+  fi
+  uci commit openclash || true
+fi
+
+/etc/init.d/bypass-tune enable >/dev/null 2>&1 || true
+
+CRON=/etc/crontabs/root
+touch "$CRON"
+grep -q '/usr/bin/bypass-health' "$CRON" 2>/dev/null || \
+  echo '*/5 * * * * /usr/bin/bypass-health >/dev/null 2>&1' >> "$CRON"
+/etc/init.d/cron enable >/dev/null 2>&1 || true
+
+rm -f /etc/uci-defaults/99-istoreos-bypass
+exit 0
