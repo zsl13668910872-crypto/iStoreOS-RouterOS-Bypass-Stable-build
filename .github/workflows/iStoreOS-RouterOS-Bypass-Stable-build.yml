@@ -1,35 +1,91 @@
-name: Build iStoreOS 24.10.8 RouterOS Bypass Stable V2.2
+# ===== 单文件版（由 scripts/make-standalone.py 生成，请勿手工编辑；改动请改源文件后重新生成）=====
+# 只需把本文件放到仓库的 .github/workflows/ 下即可使用。
+# 前 3 个 Materialize 步骤会把 scripts/、files/、configs/ 里的文件写入工作区；
+# 仓库里已有的同名文件优先（可逐个覆盖定制）。
+name: Build iStoreOS x86_64 (OpenClash bypass router)
+
+# 以 iStoreOS 官方发布的 config.seed / feeds.buildinfo / commit.buildinfo 为基线，叠加自定义项，
+# 编译 x86_64 EFI 固件（适合 PVE 虚拟机 / 物理小主机作 RouterOS 主路由后的旁路由）。
+# 所有可测试的逻辑都放在 scripts/ 下，由 .github/workflows/preflight.yml 在改动后自动做离线预检。
 
 on:
   workflow_dispatch:
     inputs:
-      istoreos_version:
-        description: 'iStoreOS 版本号或分支/标签（默认 24.10.8）'
+      branch:
+        description: 'iStoreOS 源码分支'
+        required: true
+        type: choice
+        default: 'istoreos-25.12'
+        options:
+          - istoreos-25.12
+          - istoreos-24.10
+      config_source:
+        description: '配置来源：official=下载官方 config.seed；repo=用仓库 configs/base.seed（没有则用 fallback.seed）'
+        required: true
+        type: choice
+        default: 'official'
+        options:
+          - official
+          - repo
+      official_base_url:
+        description: '官方构建输入所在目录（需含 config.seed / feeds.buildinfo / commit.buildinfo）'
         required: false
         type: string
-        default: '24.10.8'
-      enable_backup_proxy:
-        description: '预装 PassWall / PassWall2 作为备用代理栈（默认开启，但默认不启动）'
+        default: 'https://fw.koolcenter.com/iStoreOS/x86_64'
+      pin_official_commit:
+        description: '源码锁定到官方 commit.buildinfo 的提交（与种子配置严格匹配；不一致会直接报错）'
         required: false
         type: boolean
         default: true
-      enable_extra_proxy_stacks:
-        description: '额外集成 Nikki / HomeProxy / MosDNS / SmartDNS（稳定优先，默认关闭）'
-        required: false
-        type: boolean
-        default: false
-      enable_bbr:
-        description: '启用 BBR 拥塞控制（旁路由自身到机场节点的 TCP 连接受益，默认开启；开机自动检测）'
+      feeds_mode:
+        description: 'feeds 来源：official-pinned=用官方锁定版本；branch-head=用源码树自带最新 feeds'
+        required: true
+        type: choice
+        default: 'official-pinned'
+        options:
+          - official-pinned
+          - branch-head
+      enable_openclash:
+        description: '集成 OpenClash（固定版本源码编译）'
         required: false
         type: boolean
         default: true
+      openclash_version:
+        description: 'OpenClash 版本（Git tag，不带 v）'
+        required: false
+        type: string
+        default: '0.47.156'
       preload_openclash_core:
-        description: '把 Mihomo(Meta) 内核预置进固件（首次开机无需联网下载；下载失败不阻断编译）'
+        description: '预置 Mihomo(Meta) 内核与 Geo 数据库（下载失败不影响编译）'
         required: false
         type: boolean
         default: true
+      enable_bbr:
+        description: '启用 BBR（开机检测，不支持则保持默认）'
+        required: false
+        type: boolean
+        default: true
+      rootfs_type:
+        description: '根文件系统：squashfs（官方默认，可恢复出厂）/ ext4（易扩容）/ both'
+        required: true
+        type: choice
+        default: 'squashfs'
+        options:
+          - squashfs
+          - ext4
+          - both
+      rootfs_partsize:
+        description: '根分区大小 MiB（256~16384）'
+        required: false
+        type: string
+        default: '4096'
+      custom_packages:
+        description: '额外软件包，空格分隔（例 luci-app-ttyd luci-app-wol；源码树里没有的会被跳过）'
+        required: false
+        type: string
+        default: ''
       lan_ipaddr:
-        description: '可选：旁路由 LAN IP（留空=不改动，沿用镜像默认值；例 192.168.1.2）'
+        description: '可选：LAN IP（留空=沿用镜像默认；例 192.168.1.2）。强烈建议与 RouterOS 同网段且不冲突'
         required: false
         type: string
         default: ''
@@ -43,391 +99,329 @@ on:
         required: false
         type: string
         default: ''
+      retention_fail_threshold:
+        description: '官方种子里的软件包被 defconfig 丢弃超过多少个就判失败（防止镜像缩水）'
+        required: false
+        type: string
+        default: '10'
       publish_release:
         description: '构建成功后发布 GitHub Release'
         required: false
         type: boolean
         default: false
 
-env:
-  ISTOREOS_VERSION: ${{ inputs.istoreos_version || '24.10.8' }}
-  ROOTFS_PARTSIZE: '4096'
-  OPENCLASH_VERSION: '0.47.156'
-  V2_VERSION: 'V2.2-iStoreOS-24.10.8-Bypass'
-
 permissions:
   contents: write
+
+env:
+  ISTOREOS_REPO: 'https://github.com/istoreos/istoreos.git'
+  SRC_DIR: istoreos
+  INPUTS_DIR: build-inputs
+  PACK_VERSION: 'istoreos-bypass-1.0'
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # 官方完整软件包集合在 4 核公共 runner 上常需 3~5 小时；GitHub 单 job 上限 6 小时
     timeout-minutes: 350
 
     steps:
-      - name: Checkout custom build repo
+      - name: Checkout this repo (scripts / files / configs)
         uses: actions/checkout@v4
 
-      - name: Validate optional network inputs
+      - name: Materialize helper scripts (standalone mode)
         shell: bash
-        env:
-          IN_IP: ${{ inputs.lan_ipaddr }}
-          IN_MASK: ${{ inputs.lan_netmask }}
-          IN_GW: ${{ inputs.lan_gateway }}
         run: |
           set -euo pipefail
-          ipre='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-          for v in "$IN_IP" "$IN_GW"; do
-            if [ -n "$v" ] && ! printf '%s' "$v" | grep -Eq "$ipre"; then
-              echo "::error::非法 IPv4 地址: $v"; exit 1
+          put() {  # put 目标路径 权限   （内容来自 stdin；目标已存在则保留仓库版本）
+            local dest="$1" mode="$2"
+            if [ -e "$dest" ]; then
+              cat > /dev/null; echo "[keep ] $dest (仓库已有，使用仓库版本)"
+            else
+              mkdir -p "$(dirname "$dest")"; cat > "$dest"; chmod "$mode" "$dest"; echo "[write] $dest"
             fi
+          }
+          put 'scripts/fetch-official.sh' 755 <<'__PACK_EOF__'
+          #!/bin/bash
+          # fetch-official.sh BASE_URL OUT_DIR
+          # 从 iStoreOS 官方固件目录下载构建输入（种子配置 / 锁定版本的 feeds / 源码提交），并做合法性校验。
+          #   官方目录示例： https://fw.koolcenter.com/iStoreOS/x86_64/
+          #   其中的 config.seed / config.buildinfo、feeds.buildinfo / feeds.conf、commit.buildinfo 由官方构建产出。
+          # 输出（OUT_DIR）： base.seed  feeds.pinned  commit.txt  status.env
+          # 任何一步失败都不会让脚本退出非 0：由调用方根据 status.env 决定回退策略。
+          set -u
+          BASE="${1:?用法: fetch-official.sh BASE_URL OUT_DIR}"
+          OUT="${2:?用法: fetch-official.sh BASE_URL OUT_DIR}"
+          BASE="${BASE%/}"
+          mkdir -p "$OUT"
+          rm -f "$OUT"/base.seed "$OUT"/feeds.pinned "$OUT"/commit.txt "$OUT"/status.env
+
+          fetch() { # 远端文件名 本地路径
+            curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 90 \
+                 -o "$2" "$BASE/$1" 2>/dev/null
+          }
+
+          valid_seed() { # 必须是 x86_64 目标，且不能是别的平台
+            local f="$1"
+            [ -s "$f" ] || return 1
+            grep -q '^CONFIG_TARGET_x86=y' "$f" || return 1
+            grep -Eq '^CONFIG_TARGET_x86_64(=y|_DEVICE_)' "$f" || return 1
+            if grep -Eq '^CONFIG_TARGET_(rockchip|armsr|mediatek|ramips|mvebu|sunxi)=y' "$f"; then return 1; fi
+            return 0
+          }
+
+          seed_ok=0; seed_name=""
+          for n in config.seed config.buildinfo; do
+            tmp="$OUT/.dl.$$"
+            if fetch "$n" "$tmp"; then
+              if valid_seed "$tmp"; then
+                mv "$tmp" "$OUT/base.seed"; seed_ok=1; seed_name="$n"
+                echo "[OK]   种子配置 <- $n ($(wc -l < "$OUT/base.seed") 行)"
+                break
+              else
+                echo "[WARN] $n 已下载但不是 x86_64 配置，忽略"
+              fi
+            else
+              echo "[WARN] 无法下载 $n"
+            fi
+            rm -f "$tmp"
           done
-          if [ -n "$IN_IP" ] && ! printf '%s' "$IN_MASK" | grep -Eq "$ipre"; then
-            echo "::error::非法子网掩码: $IN_MASK"; exit 1
-          fi
 
-      - name: Free disk space
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          sudo docker image prune --all --force || true
-          df -h /
-
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git \
-            libncurses5-dev libssl-dev python3-setuptools python3-pyelftools libpython3-dev \
-            rsync unzip zlib1g-dev file wget curl time libelf-dev ecj fastjar \
-            java-propose-classpath python3 swig zstd subversion xsltproc qemu-utils \
-            ccache xz-utils patch perl tar gzip bzip2 p7zip-full
-
-      - name: Clone iStoreOS source
-        shell: bash
-        run: |
-          set -euxo pipefail
-          REPO_URL="https://github.com/istoreos/istoreos.git"
-          TARGET_REF="${ISTOREOS_VERSION}"
-
-          # 自动兼容带 v 前缀、istoreos- 前缀或纯分支名称的标签
-          cloned=0
-          for ref in "v${TARGET_REF}" "istoreos-${TARGET_REF}" "${TARGET_REF}" "istoreos-24.10"; do
-            echo "[INFO] 尝试克隆分支/标签: ${ref}"
-            if git clone --branch "${ref}" --single-branch --depth 1 "${REPO_URL}" istoreos; then
-              echo "[OK] 成功克隆: ${ref}"
-              cloned=1
+          feeds_ok=0; feeds_name=""
+          for n in feeds.buildinfo feeds.conf; do
+            tmp="$OUT/.dl.$$"
+            if fetch "$n" "$tmp" && grep -Eq '^src-(git|git-full|link|svn)' "$tmp"; then
+              mv "$tmp" "$OUT/feeds.pinned"; feeds_ok=1; feeds_name="$n"
+              echo "[OK]   feeds 列表 <- $n ($(grep -c '^src-' "$OUT/feeds.pinned") 个源)"
               break
             fi
+            rm -f "$tmp"
           done
+          [ "$feeds_ok" -eq 1 ] || echo "[WARN] 未取得官方 feeds 列表，将使用源码树自带的 feeds.conf.default"
 
-          if [ "$cloned" -ne 1 ]; then
-            echo "::error::未能成功拉取指定的 iStoreOS 版本/分支: ${TARGET_REF}"
-            exit 1
-          fi
-
-      - name: Restore downloaded source archives
-        uses: actions/cache/restore@v4
-        with:
-          path: istoreos/dl
-          key: istoreos-dl-${{ env.ISTOREOS_VERSION }}-${{ github.run_id }}
-          restore-keys: |
-            istoreos-dl-${{ env.ISTOREOS_VERSION }}-
-            istoreos-dl-
-
-      - name: Update and install feeds
-        working-directory: istoreos
-        shell: bash
-        env:
-          BACKUP_PROXY: ${{ inputs.enable_backup_proxy }}
-          EXTRA_STACKS: ${{ inputs.enable_extra_proxy_stacks }}
-        run: |
-          set -euo pipefail
-
-          if [ "$BACKUP_PROXY" = 'true' ]; then
-            cat >> feeds.conf.default <<'EOF'
-          src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git
-          src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git
-          EOF
-          fi
-
-          if [ "$EXTRA_STACKS" = 'true' ]; then
-            cat >> feeds.conf.default <<'EOF'
-          src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git
-          src-git homeproxy https://github.com/immortalwrt/homeproxy.git
-          src-git mosdns https://github.com/sbwml/luci-app-mosdns.git
-          EOF
-          fi
-
-          echo '===== feeds.conf.default ====='
-          cat feeds.conf.default
-
-          for attempt in 1 2 3; do
-            ./scripts/feeds update -a && break || echo "[WARN] feeds update attempt ${attempt} returned non-zero"
-            sleep 10
-          done
-
-          for base in packages luci; do
-            if [ ! -d "feeds/${base}" ] || [ -z "$(ls -A "feeds/${base}" 2>/dev/null)" ]; then
-              echo "::error::基础 feed '${base}' 更新失败，无法继续。"
-              exit 1
+          commit=""
+          tmp="$OUT/.dl.$$"
+          if fetch commit.buildinfo "$tmp"; then
+            c="$(tr -d '[:space:]' < "$tmp")"
+            if printf '%s' "$c" | grep -Eq '^[0-9a-f]{7,40}$'; then
+              commit="$c"; printf '%s\n' "$commit" > "$OUT/commit.txt"
+              echo "[OK]   官方构建提交 <- commit.buildinfo ($commit)"
+            else
+              echo "[WARN] commit.buildinfo 内容不是提交哈希，忽略"
             fi
-          done
-
-          ./scripts/feeds install -a || echo '[WARN] feeds install -a returned non-zero'
-
-          if [ "$BACKUP_PROXY" = 'true' ]; then
-            for f in passwall passwall2; do
-              if [ -d "feeds/${f}" ]; then
-                ./scripts/feeds install -a -f -p "$f" || true
-              else
-                echo "[WARN] feed ${f} 不可用，跳过覆盖。"
-              fi
-            done
+          else
+            echo "[WARN] 无法下载 commit.buildinfo"
           fi
-          if [ "$EXTRA_STACKS" = 'true' ]; then
-            for f in nikki homeproxy mosdns; do
-              if [ -d "feeds/${f}" ]; then
-                ./scripts/feeds install -a -f -p "$f" || true
-              else
-                echo "[WARN] feed ${f} 不可用，跳过覆盖。"
-              fi
-            done
-          fi
+          rm -f "$tmp"
 
-      - name: Pin OpenClash source
-        working-directory: istoreos
-        shell: bash
-        run: |
-          set -euxo pipefail
-          rm -rf feeds/*/luci-app-openclash package/feeds/*/luci-app-openclash
-          rm -rf package/openclash
-          git clone --branch "v${OPENCLASH_VERSION}" --single-branch --depth 1 \
-            https://github.com/vernesong/OpenClash.git package/openclash
-          find package/openclash -maxdepth 2 -type f -name Makefile -print -quit | grep -q .
-
-      - name: Configure target and package baseline
-        working-directory: istoreos
-        shell: bash
-        env:
-          ENABLE_BBR: ${{ inputs.enable_bbr }}
-        run: |
+          {
+            echo "OFFICIAL_SEED=$seed_ok"
+            echo "OFFICIAL_SEED_NAME=$seed_name"
+            echo "OFFICIAL_FEEDS=$feeds_ok"
+            echo "OFFICIAL_FEEDS_NAME=$feeds_name"
+            echo "OFFICIAL_COMMIT=$commit"
+          } > "$OUT/status.env"
+          exit 0
+          __PACK_EOF__
+          put 'scripts/assemble-config.sh' 755 <<'__PACK_EOF__'
+          #!/bin/bash
+          # assemble-config.sh SEED OVERLAY      （在源码树根目录运行）
+          # 生成 .config：  官方/回退 种子  <  仓库 overlay.config  <  工作流输入（后者覆盖前者）
+          # 环境变量：ROOTFS_PARTSIZE(默认4096)  ROOTFS_TYPE(squashfs|ext4|both，默认squashfs)
+          #          ENABLE_BBR(true/false)  ENABLE_OPENCLASH(true/false)  CUSTOM_PACKAGES(空格分隔)
           set -euo pipefail
+          SEED="${1:?SEED}"; OVERLAY="${2:?OVERLAY}"
+          [ -s "$SEED" ] || { echo "::error::种子配置为空: $SEED"; exit 1; }
 
-          cat > .config <<'EOF'
-          CONFIG_TARGET_x86=y
-          CONFIG_TARGET_x86_64=y
-          CONFIG_TARGET_x86_64_DEVICE_generic=y
-          CONFIG_TARGET_BOARD="x86"
-          CONFIG_TARGET_SUBTARGET="64"
-          CONFIG_TARGET_PROFILE="DEVICE_generic"
-          CONFIG_TARGET_ARCH_PACKAGES="x86_64"
-          CONFIG_x86_64=y
-          CONFIG_ARCH="x86_64"
+          ROOTFS_PARTSIZE="${ROOTFS_PARTSIZE:-4096}"
+          ROOTFS_TYPE="${ROOTFS_TYPE:-squashfs}"
+          ENABLE_BBR="${ENABLE_BBR:-true}"
+          ENABLE_OPENCLASH="${ENABLE_OPENCLASH:-true}"
+          CUSTOM_PACKAGES="${CUSTOM_PACKAGES:-}"
 
-          CONFIG_TARGET_ROOTFS_EXT4FS=y
-          CONFIG_TARGET_EXT4_RESERVED_PCT=0
-          CONFIG_TARGET_EXT4_BLOCKSIZE_4K=y
-          CONFIG_TARGET_EXT4_BLOCKSIZE=4096
-          CONFIG_TARGET_EXT4_JOURNAL=y
-          CONFIG_GRUB_IMAGES=y
-          CONFIG_GRUB_EFI_IMAGES=y
-          CONFIG_GRUB_CONSOLE=y
-          CONFIG_GRUB_BAUDRATE=115200
-          CONFIG_GRUB_TIMEOUT="3"
-          CONFIG_TARGET_KERNEL_PARTSIZE=16
-          CONFIG_TARGET_ROOTFS_PARTSIZE=4096
-          CONFIG_TARGET_IMAGES_GZIP=y
-          CONFIG_PACKAGE_grub2=y
-          CONFIG_PACKAGE_grub2-efi=y
-
-          # 网络底座与代理依赖
-          CONFIG_PACKAGE_dnsmasq-full=y
-          CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_ca-bundle=y
-          CONFIG_PACKAGE_ca-certificates=y
-          CONFIG_PACKAGE_wget-ssl=y
-          CONFIG_PACKAGE_ip-full=y
-          CONFIG_PACKAGE_ethtool=y
-          CONFIG_PACKAGE_tcpdump=y
-          CONFIG_PACKAGE_iperf3=y
-          CONFIG_PACKAGE_htop=y
-          CONFIG_PACKAGE_jq=y
-          CONFIG_PACKAGE_procps-ng=y
-          CONFIG_PACKAGE_kmod-tun=y
-          CONFIG_PACKAGE_kmod-veth=y
-          CONFIG_PACKAGE_kmod-nft-tproxy=y
-          CONFIG_PACKAGE_bind-host=y
-          CONFIG_PACKAGE_bind-dig=y
-
-          # 规避同文件互斥冲突
-          CONFIG_PACKAGE_libustream-mbedtls=y
-          # CONFIG_PACKAGE_libustream-openssl is not set
-          # CONFIG_PACKAGE_libustream-wolfssl is not set
-          # CONFIG_PACKAGE_tcpdump-mini is not set
-          # CONFIG_PACKAGE_dnsmasq is not set
-          # CONFIG_PACKAGE_dnsmasq-dhcpv6 is not set
-          # CONFIG_PACKAGE_ip-tiny is not set
-          # CONFIG_PACKAGE_ip-bridge is not set
-          # CONFIG_PACKAGE_wget-nossl is not set
-
-          # 锁定 OpenClash
-          CONFIG_PACKAGE_luci-app-openclash=y
-          EOF
-
-          if [ "$ENABLE_BBR" = 'true' ]; then
-            echo 'CONFIG_PACKAGE_kmod-tcp-bbr=y' >> .config
-          fi
-
-      - name: Select optional packages safely
-        working-directory: istoreos
-        shell: bash
-        env:
-          BACKUP_PROXY: ${{ inputs.enable_backup_proxy }}
-          EXTRA_STACKS: ${{ inputs.enable_extra_proxy_stacks }}
-        run: |
-          set -euo pipefail
-
+          dyn="$(mktemp)"
           add_if_present() {
             local pkg="$1"
             if find package feeds -maxdepth 4 -name "$pkg" -print -quit 2>/dev/null | grep -q .; then
-              echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-              echo "[OK] ${pkg}"
+              echo "CONFIG_PACKAGE_${pkg}=y" >> "$dyn"; echo "[OK]   ${pkg}"
             else
-              echo "[WARN] skip unavailable package: ${pkg}"
+              echo "[WARN] 源码树中不存在，已跳过: ${pkg}"
             fi
           }
 
-          if ! find package/openclash -maxdepth 2 -type f -name Makefile -print -quit | grep -q .; then
-            echo '[FATAL] OpenClash source tree not found.' >&2
-            exit 1
-          fi
+          {
+            echo 'CONFIG_TARGET_x86=y'
+            echo 'CONFIG_TARGET_x86_64=y'
+            echo 'CONFIG_TARGET_x86_64_DEVICE_generic=y'
+            echo 'CONFIG_GRUB_IMAGES=y'
+            echo 'CONFIG_GRUB_EFI_IMAGES=y'
+            echo "CONFIG_TARGET_ROOTFS_PARTSIZE=${ROOTFS_PARTSIZE}"
+            case "$ROOTFS_TYPE" in
+              squashfs) echo 'CONFIG_TARGET_ROOTFS_SQUASHFS=y'; echo '# CONFIG_TARGET_ROOTFS_EXT4FS is not set' ;;
+              ext4)     echo 'CONFIG_TARGET_ROOTFS_EXT4FS=y';   echo '# CONFIG_TARGET_ROOTFS_SQUASHFS is not set' ;;
+              both)     echo 'CONFIG_TARGET_ROOTFS_SQUASHFS=y'; echo 'CONFIG_TARGET_ROOTFS_EXT4FS=y' ;;
+              *) echo "::error::未知 ROOTFS_TYPE: $ROOTFS_TYPE"; exit 1 ;;
+            esac
+          } >> "$dyn"
 
-          # 虚拟化组件与 iStore 核心生态
-          add_if_present qemu-ga
-          add_if_present luci-app-store
-          add_if_present luci-app-quickstart
-          add_if_present luci-app-diskman
+          [ "$ENABLE_BBR" = true ] && echo 'CONFIG_PACKAGE_kmod-tcp-bbr=y' >> "$dyn"
+          [ "$ENABLE_OPENCLASH" = true ] && add_if_present luci-app-openclash
+          for p in $CUSTOM_PACKAGES; do add_if_present "$p"; done
 
-          if [ "$BACKUP_PROXY" = 'true' ]; then
-            add_if_present luci-app-passwall
-            add_if_present luci-app-passwall2
-          fi
-
-          if [ "$EXTRA_STACKS" = 'true' ]; then
-            add_if_present luci-app-nikki
-            add_if_present luci-app-homeproxy
-            add_if_present luci-app-mosdns
-            add_if_present luci-app-smartdns
-            add_if_present smartdns
-            add_if_present xray-core
-            add_if_present sing-box
-          fi
-
-          make defconfig
-
-      - name: Resolve package file conflicts
-        working-directory: istoreos
-        shell: bash
-        run: |
+          # 合并：后出现的同名项覆盖先出现的；纯注释/空行丢弃
+          cat "$SEED" <(echo) "$OVERLAY" <(echo) "$dyn" | tr -d '\r' | awk '
+            {
+              line=$0
+              if (match(line,/^CONFIG_[A-Za-z0-9_+.-]+=/)) { key=substr(line,1,RLENGTH-1) }
+              else if (line ~ /^# CONFIG_[A-Za-z0-9_+.-]+ is not set[[:space:]]*$/) {
+                key=line; sub(/^# /,"",key); sub(/ is not set[[:space:]]*$/,"",key); line="# " key " is not set"
+              } else { next }
+              if (!(key in idx)) { idx[key]=++n; order[n]=key }
+              val[key]=line
+            }
+            END { for (i=1;i<=n;i++) print val[order[i]] }
+          ' > .config
+          rm -f "$dyn"
+          echo "[OK]   .config 已生成：$(wc -l < .config) 行，其中 =y 软件包 $(grep -c '^CONFIG_PACKAGE_.*=y$' .config) 个"
+          __PACK_EOF__
+          put 'scripts/resolve-conflicts.sh' 755 <<'__PACK_EOF__'
+          #!/bin/bash
+          # resolve-conflicts.sh [--check-only]     （在源码树根目录运行，需先有 .config 且已 make defconfig）
+          # 处理“会往镜像里写同一个文件”的互斥软件包，避免打包阶段 check_data_file_clashes 报错：
+          #   libustream-*  /lib/libustream-ssl.so         tcpdump / tcpdump-mini  /usr/bin/tcpdump
+          #   dnsmasq*      /usr/sbin/dnsmasq              ip-full / ip-tiny / ip-bridge
+          #   wget-ssl / wget-nossl                         wpad*  /usr/sbin/hostapd
+          #   odhcpd / odhcpd-ipv6only
+          # 策略（每个家族）：保留“用户/官方种子显式选择”的那个（读取 $ASSEMBLED，默认 .config.assembled），
+          #   其余先关闭；若被依赖包 select 回来（说明是硬依赖），则反过来放弃原先保留的；
+          #   两边都被硬依赖时在编译前失败，并打印是谁选了它。
+          # 被关闭的包写入 .resolver-dropped，供 check-retention.sh 排除。
           set -euo pipefail
+          CHECK_ONLY=0; [ "${1:-}" = "--check-only" ] && CHECK_ONLY=1
+          ASSEMBLED="${ASSEMBLED:-.config.assembled}"
+
+          FAMILIES=(
+            "libustream-mbedtls libustream-openssl libustream-wolfssl"
+            "tcpdump tcpdump-mini"
+            "dnsmasq-full dnsmasq dnsmasq-dhcpv6"
+            "ip-full ip-tiny ip-bridge"
+            "wget-ssl wget-nossl"
+            "wpad-openssl wpad-mbedtls wpad-wolfssl wpad-basic-mbedtls wpad-basic-openssl wpad-basic-wolfssl wpad-mini"
+            "odhcpd odhcpd-ipv6only"
+          )
 
           pkg_on()  { grep -q "^CONFIG_PACKAGE_${1}=y" .config; }
+          in_assembled() { [ -f "$ASSEMBLED" ] && grep -q "^CONFIG_PACKAGE_${1}=y" "$ASSEMBLED"; }
           pkg_off() {
             sed -i "/^CONFIG_PACKAGE_${1}=/d;/^# CONFIG_PACKAGE_${1} is not set/d" .config
             echo "# CONFIG_PACKAGE_${1} is not set" >> .config
+            echo "$1" >> .resolver-dropped.tmp
           }
           pkg_set() {
             sed -i "/^CONFIG_PACKAGE_${1}=/d;/^# CONFIG_PACKAGE_${1} is not set/d" .config
             echo "CONFIG_PACKAGE_${1}=y" >> .config
+            sed -i "/^${1}\$/d" .resolver-dropped.tmp
           }
           who_selects() {
-            echo "----- 依赖/选择 ${1} 的来源 -----"
+            echo "----- 谁依赖/选择了 ${1} -----"
             [ -f tmp/.config-package.in ] || { echo '  (tmp/.config-package.in 不存在)'; return 0; }
             awk -v t="PACKAGE_${1}" '
               /^config /{cur=$2}
               $0 ~ ("select " t "($|[ \t])") {print "  <- " cur}
             ' tmp/.config-package.in | sort -u | head -n 20 || true
           }
+          count_on() { local c=0 p; for p in "$@"; do pkg_on "$p" && c=$((c+1)); done; echo "$c"; }
 
-          resolve_family() {
-            local keep="$1" drops="$2" alt
-            for alt in ${drops//,/ }; do
-              if pkg_on "$keep" && pkg_on "$alt"; then
-                echo "[CONFLICT] ${keep} 与 ${alt} 冲突，开始自动处理"
-                pkg_off "$alt"
-                make defconfig >/dev/null 2>&1
-                if pkg_on "$alt"; then
-                  echo "[INFO] ${alt} 被强制依赖重新选择，转为剔除 ${keep}"
-                  who_selects "$alt"
-                  pkg_off "$keep"
-                  pkg_set "$alt"
-                  make defconfig >/dev/null 2>&1
-                  if pkg_on "$keep"; then
-                    echo "::error::${keep} 与 ${alt} 均被硬依赖选中，无法自动解决冲突。"
-                    who_selects "$keep"
-                    exit 1
-                  fi
-                  echo "[FIXED] 保留 ${alt}，关闭 ${keep}"
-                else
-                  echo "[FIXED] 保留 ${keep}，关闭 ${alt}"
-                fi
+          if [ "$CHECK_ONLY" -eq 1 ]; then
+            bad=0
+            for fam in "${FAMILIES[@]}"; do
+              # shellcheck disable=SC2086
+              if [ "$(count_on $fam)" -gt 1 ]; then
+                echo "::error::互斥包同时启用: $(for p in $fam; do pkg_on "$p" && printf '%s ' "$p"; done)"; bad=1
               fi
             done
+            [ "$bad" -eq 0 ] && echo '[OK]   无同文件互斥包同时启用'
+            exit "$bad"
+          fi
+
+          : > .resolver-dropped.tmp
+          resolve_family() {
+            local fam=($1) on=() order=() p keep
+            for p in "${fam[@]}"; do pkg_on "$p" && on+=("$p"); done
+            [ "${#on[@]}" -le 1 ] && return 0
+            echo "[CONFLICT] ${on[*]} 同时启用"
+            for p in "${on[@]}"; do in_assembled "$p" && order+=("$p"); done      # 显式选择优先
+            for p in "${on[@]}"; do in_assembled "$p" || order+=("$p"); done      # 其余按家族顺序
+            keep="${order[0]}"
+            for p in "${order[@]:1}"; do
+              pkg_off "$p"; make defconfig >/dev/null 2>&1
+              if pkg_on "$p"; then
+                echo "[INFO] ${p} 被硬依赖重新选中，改为放弃 ${keep}"
+                who_selects "$p"
+                pkg_off "$keep"; pkg_set "$p"; make defconfig >/dev/null 2>&1
+                if pkg_on "$keep"; then
+                  echo "::error::${keep} 与 ${p} 均被硬依赖选中，无法自动解决。"
+                  who_selects "$keep"; exit 1
+                fi
+                keep="$p"
+              fi
+            done
+            echo "[FIXED] 保留 ${keep}"
           }
 
           for round in 1 2; do
-            resolve_family libustream-mbedtls libustream-openssl,libustream-wolfssl
-            resolve_family tcpdump tcpdump-mini
-            resolve_family dnsmasq-full dnsmasq,dnsmasq-dhcpv6
-            resolve_family ip-full ip-tiny,ip-bridge
-            resolve_family wget-ssl wget-nossl
+            for fam in "${FAMILIES[@]}"; do resolve_family "$fam"; done
           done
 
-          n_ssl=0
-          for p in libustream-mbedtls libustream-openssl libustream-wolfssl; do pkg_on "$p" && n_ssl=$((n_ssl+1)); done
-          if [ "$n_ssl" -gt 1 ]; then echo '::error::libustream-* 仍有多个包处于开启状态'; exit 1; fi
+          bash "$0" --check-only
+          sort -u .resolver-dropped.tmp > .resolver-dropped; rm -f .resolver-dropped.tmp
+          echo "[OK]   冲突处理完成；已关闭: $(tr '\n' ' ' < .resolver-dropped)"
+          __PACK_EOF__
+          put 'scripts/check-retention.sh' 755 <<'__PACK_EOF__'
+          #!/bin/bash
+          # check-retention.sh SEED      （在源码树根目录运行，已 make defconfig 之后）
+          # 校验：种子里声明的 =y 软件包（且没被 overlay 取消），经过 defconfig 之后是否还在。
+          # 若 feeds 没装全 / 依赖不满足，defconfig 会悄悄把它们丢掉，镜像就会“缩水”。
+          # 环境变量：THRESHOLD(默认10)  MODE(strict|warn，默认strict)  ASSEMBLED(默认 .config.assembled)
+          set -euo pipefail
+          SEED="${1:?SEED}"
+          THRESHOLD="${THRESHOLD:-10}"; MODE="${MODE:-strict}"
+          ASSEMBLED="${ASSEMBLED:-.config.assembled}"
+          list() { grep -E '^CONFIG_PACKAGE_[^=]+=y$' "$1" | sed -E 's/^CONFIG_PACKAGE_([^=]+)=y$/\1/' | sort -u; }
+          ours="$(mktemp)"; comm -12 <(list "$SEED") <(list "$ASSEMBLED") > "$ours"
+          final="$(mktemp)"; list .config > "$final"
+          dropped="$(mktemp)"; if [ -f .resolver-dropped ]; then sort -u .resolver-dropped > "$dropped"; else : > "$dropped"; fi
+          missing="$(comm -23 "$ours" "$final" | comm -23 - "$dropped")"
+          n=0; [ -n "$missing" ] && n="$(printf '%s\n' "$missing" | wc -l)"
+          total="$(wc -l < "$ours")"
+          echo "[INFO] 种子声明的软件包 ${total} 个，defconfig 后缺失 ${n} 个（阈值 ${THRESHOLD}，模式 ${MODE}）"
+          [ "$n" -gt 0 ] && printf '%s\n' "$missing" | head -n 60 | sed 's/^/       - /'
+          if [ "$n" -gt "$THRESHOLD" ] && [ "$MODE" = strict ]; then
+            echo "::error::有 ${n} 个官方声明的软件包被 defconfig 丢弃，超过阈值 ${THRESHOLD}。通常是 feeds 未装全或依赖缺失。"
+            exit 1
+          fi
+          [ "$n" -gt 0 ] && echo "::warning::${n} 个种子软件包未进入最终配置（未超过阈值）"
+          exit 0
+          __PACK_EOF__
 
-          echo '===== FINAL CONFLICT CHECK ====='
-          for pair in libustream-mbedtls:libustream-openssl tcpdump:tcpdump-mini dnsmasq-full:dnsmasq ip-full:ip-tiny wget-ssl:wget-nossl; do
-            a="${pair%%:*}"; b="${pair##*:}"
-            if pkg_on "$a" && pkg_on "$b"; then
-              echo "::error::互斥文件冲突依然存在: ${a} + ${b}"; exit 1
-            fi
-          done
-          grep -E '^CONFIG_PACKAGE_(libustream-[a-z]+|tcpdump(-mini)?|dnsmasq(-full|-dhcpv6)?|ip-(full|tiny|bridge)|wget-(ssl|nossl))=' .config || true
-          echo '[OK] 互斥包排查完毕，无冲突项'
-
-      - name: Inject RouterOS bypass runtime files
-        working-directory: istoreos
+      - name: Materialize rootfs overlay files (standalone mode)
         shell: bash
-        env:
-          ENABLE_BBR: ${{ inputs.enable_bbr }}
-          IN_IP: ${{ inputs.lan_ipaddr }}
-          IN_MASK: ${{ inputs.lan_netmask }}
-          IN_GW: ${{ inputs.lan_gateway }}
         run: |
           set -euo pipefail
-
-          mkdir -p files/etc/uci-defaults files/etc/openclash/custom files/etc/sysctl.d \
-                   files/usr/bin files/etc/init.d files/etc/config files/etc/routeros-bypass files/root
-
-          # OKTV 直连规则（含必须的 "rules:" 标签声明）
-          cat > files/etc/openclash/custom/openclash_custom_rules.list <<'EOF'
-          rules:
-          - DOMAIN-SUFFIX,hidns.vip,DIRECT
-          - DOMAIN-SUFFIX,cmliussss.com,DIRECT
-          - DOMAIN-SUFFIX,090227.xyz,DIRECT
-          - DOMAIN,tvbbox.pgjgr.eu.cc,DIRECT
-          EOF
-
-          # 内核网络参数调优（适配 x86 旁路由高并发/UDP/长肥管道）
-          cat > files/etc/sysctl.d/98-routeros-bypass-v2.conf <<'EOF'
-          # RouterOS main router + iStoreOS bypass router
+          put() {  # put 目标路径 权限   （内容来自 stdin；目标已存在则保留仓库版本）
+            local dest="$1" mode="$2"
+            if [ -e "$dest" ]; then
+              cat > /dev/null; echo "[keep ] $dest (仓库已有，使用仓库版本)"
+            else
+              mkdir -p "$(dirname "$dest")"; cat > "$dest"; chmod "$mode" "$dest"; echo "[write] $dest"
+            fi
+          }
+          put 'files/etc/sysctl.d/98-bypass-tune.conf' 644 <<'__PACK_EOF__'
+          # iStoreOS 25.12 x86_64 旁路由 + OpenClash：长流 / QUIC / Hysteria2 场景的保守调优
           net.ipv4.ip_forward = 1
+          # 视频分片是“突发-空闲”流量；空闲后不重置拥塞窗口，避免每个分片重新慢启动
           net.ipv4.tcp_slow_start_after_idle = 0
+          # 隧道/PPPoE 场景 PMTU 黑洞自动探测
           net.ipv4.tcp_mtu_probing = 1
           net.ipv4.tcp_fastopen = 3
           net.ipv4.tcp_syncookies = 1
@@ -435,6 +429,7 @@ jobs:
           net.ipv4.tcp_no_metrics_save = 1
           net.ipv4.tcp_tw_reuse = 1
           net.ipv4.ip_local_port_range = 10240 65535
+          # 缓冲上限 16MB：满足高 RTT 链路的带宽时延积，也满足 quic-go / Hysteria2 对 UDP 缓冲(>=7.5MB)的要求
           net.core.rmem_max = 16777216
           net.core.wmem_max = 16777216
           net.ipv4.tcp_rmem = 4096 131072 16777216
@@ -443,32 +438,107 @@ jobs:
           net.ipv4.udp_wmem_min = 16384
           net.core.netdev_max_backlog = 16384
           net.core.somaxconn = 4096
+          # conntrack 超时：默认 ESTABLISHED 为 5 天，代理场景会堆积大量死连接
           net.netfilter.nf_conntrack_tcp_timeout_established = 7200
           net.netfilter.nf_conntrack_udp_timeout = 30
           net.netfilter.nf_conntrack_udp_timeout_stream = 60
-          EOF
+          __PACK_EOF__
+          put 'files/etc/openclash/custom/openclash_custom_rules.list' 644 <<'__PACK_EOF__'
+          rules:
+          - DOMAIN-SUFFIX,hidns.vip,DIRECT
+          - DOMAIN-SUFFIX,cmliussss.com,DIRECT
+          - DOMAIN-SUFFIX,090227.xyz,DIRECT
+          - DOMAIN,tvbbox.pgjgr.eu.cc,DIRECT
+          __PACK_EOF__
+          put 'files/etc/init.d/bypass-tune' 755 <<'__PACK_EOF__'
+          #!/bin/sh /etc/rc.common
+          START=95
+          STOP=05
+          USE_PROCD=0
 
-          if [ "$ENABLE_BBR" = 'true' ]; then
-            echo 1 > files/etc/routeros-bypass/bbr
+          start() {
+            # sysctl 服务早于内核模块加载，nf_conntrack/BBR 相关键此时可能还不存在，这里重新应用
+            sysctl -e -q -p /etc/sysctl.d/98-bypass-tune.conf >/dev/null 2>&1 || true
+
+            if [ -f /etc/routeros-bypass/bbr ]; then
+              modprobe tcp_bbr >/dev/null 2>&1 || true
+              avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+              case " $avail " in
+                *" bbr "*)
+                  sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+                  logger -t bypass-tune "BBR enabled" ;;
+                *) logger -t bypass-tune "BBR not available in this kernel; keeping default" ;;
+              esac
+            fi
+
+            mem_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 2048)
+            if [ "$mem_mb" -ge 6144 ]; then max=262144
+            elif [ "$mem_mb" -ge 3072 ]; then max=131072
+            else max=65536; fi
+            sysctl -w "net.netfilter.nf_conntrack_max=$max" >/dev/null 2>&1 || true
+            logger -t bypass-tune "baseline loaded; conntrack_max=$max"
+            /usr/bin/bypass-apply apply >/dev/null 2>&1 || true
+          }
+
+          stop() { :; }
+          __PACK_EOF__
+          put 'files/etc/uci-defaults/99-istoreos-bypass' 755 <<'__PACK_EOF__'
+          #!/bin/sh
+          # 首次开机一次性执行；幂等；只有构建时填写了 LAN 参数才改 LAN IP/网关
+          set -u
+          [ -f /etc/routeros-bypass/lan.conf ] && . /etc/routeros-bypass/lan.conf
+          LAN_IP="${LAN_IP:-}"; LAN_MASK="${LAN_MASK:-255.255.255.0}"; LAN_GW="${LAN_GW:-}"
+
+          if [ -n "$LAN_IP" ] && uci -q get network.lan >/dev/null 2>&1; then
+            uci set network.lan.proto='static'
+            uci set network.lan.ipaddr="$LAN_IP"
+            uci set network.lan.netmask="$LAN_MASK"
+            if [ -n "$LAN_GW" ]; then
+              uci set network.lan.gateway="$LAN_GW"
+              uci -q delete network.lan.dns
+              uci add_list network.lan.dns="$LAN_GW"
+            fi
+            uci -q delete network.lan.ip6assign
           fi
 
-          {
-            echo "LAN_IP='${IN_IP}'"
-            echo "LAN_MASK='${IN_MASK}'"
-            echo "LAN_GW='${IN_GW}'"
-          } > files/etc/routeros-bypass/lan.conf
+          # 多核 x86：软件包转向(packet steering)把软中断分散到各 CPU；单核无影响
+          if uci -q get network.globals >/dev/null 2>&1; then
+            uci set network.globals.packet_steering='1'
+          fi
+          uci commit network 2>/dev/null || true
 
-          # apply / direct 模式切换工具
-          cat > files/usr/bin/routeros-bypass-apply <<'EOF'
+          if [ -x /usr/bin/bypass-apply ]; then /usr/bin/bypass-apply apply >/dev/null 2>&1 || true; fi
+
+          if uci -q get openclash.config >/dev/null 2>&1; then
+            if [ -x /etc/openclash/core/clash_meta ]; then
+              uci set openclash.config.core_type='Meta' 2>/dev/null || true
+            fi
+            uci commit openclash || true
+          fi
+
+          /etc/init.d/bypass-tune enable >/dev/null 2>&1 || true
+
+          CRON=/etc/crontabs/root
+          touch "$CRON"
+          grep -q '/usr/bin/bypass-health' "$CRON" 2>/dev/null || \
+            echo '*/5 * * * * /usr/bin/bypass-health >/dev/null 2>&1' >> "$CRON"
+          /etc/init.d/cron enable >/dev/null 2>&1 || true
+
+          rm -f /etc/uci-defaults/99-istoreos-bypass
+          exit 0
+          __PACK_EOF__
+          put 'files/usr/bin/bypass-apply' 755 <<'__PACK_EOF__'
           #!/bin/sh
+          # bypass-apply [apply|direct]
+          #   apply  幂等地应用旁路由基线（IPv4-only、关 flow offloading、OpenClash 基线、DNS 链）
+          #   direct 回滚：恢复 dnsmasq 直连上游并停止 OpenClash
           set -u
-
-          log() { logger -t routeros-bypass-v2 -- "$*"; echo "$*"; }
+          log()  { logger -t bypass-apply -- "$*"; echo "$*"; }
           uget() { uci -q get "$1" 2>/dev/null || true; }
 
           case "${1:-apply}" in
             apply)
-              log "Applying RouterOS-bypass baseline..."
+              log "Applying bypass-router baseline..."
               changed_dns=0
 
               if uci -q get dhcp.lan >/dev/null 2>&1; then
@@ -477,13 +547,13 @@ jobs:
                 uci set dhcp.lan.dhcpv6='disabled'
                 uci set dhcp.lan.ndp='disabled'
               fi
-
               for s in $(uci show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=odhcpd$/\1/p'); do
                 uci set "dhcp.${s}.ra=disabled" 2>/dev/null || true
                 uci set "dhcp.${s}.dhcpv6=disabled" 2>/dev/null || true
                 uci set "dhcp.${s}.ndp=disabled" 2>/dev/null || true
               done
 
+              # Flow offloading 与 TUN/透明代理叠加时长流易降速
               if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
                 uci set firewall.@defaults[0].flow_offloading='0'
                 uci set firewall.@defaults[0].flow_offloading_hw='0'
@@ -514,11 +584,12 @@ jobs:
                   uci set dhcp.@dnsmasq[0].noresolv='1'
                   uci -q delete dhcp.@dnsmasq[0].server
                   uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#1053'
+                  # 不缓存 fake-ip 应答：OpenClash 重启后映射会变，dnsmasq 缓存旧值会让连接指向错误域名
                   uci set dhcp.@dnsmasq[0].cachesize='0'
                   changed_dns=1
                 fi
               else
-                log "No usable OpenClash YAML yet; keeping normal system DNS."
+                log "No usable OpenClash YAML yet; keeping normal system DNS to avoid a half-installed DNS outage."
               fi
 
               uci commit dhcp 2>/dev/null || true
@@ -534,7 +605,6 @@ jobs:
               /etc/init.d/firewall reload >/dev/null 2>&1 || true
               exit 0
               ;;
-
             direct)
               log "Restoring direct DNS mode (rollback)."
               if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
@@ -547,34 +617,29 @@ jobs:
               /etc/init.d/openclash stop >/dev/null 2>&1 || true
               exit 0
               ;;
-
             *)
-              echo "Usage: routeros-bypass-apply [apply|direct]"
-              exit 1
-              ;;
+              echo "Usage: bypass-apply [apply|direct]"; exit 1 ;;
           esac
-          EOF
-          chmod 755 files/usr/bin/routeros-bypass-apply
-
-          # 防抖健康监测脚本（连续 2 次探针失联触发重置，内置 15 分钟冷却期）
-          cat > files/usr/bin/routeros-bypass-health <<'EOF'
+          __PACK_EOF__
+          put 'files/usr/bin/bypass-health' 755 <<'__PACK_EOF__'
           #!/bin/sh
+          # 健康检查（由 cron 每 5 分钟调用）。
+          # 只在“Mihomo 进程消失”或“本地 DNS 链连续 2 次探测失败”时才重启 OpenClash，且 15 分钟冷却，
+          # 避免远端站点故障导致的重启风暴（会打断在播视频）。远端可用性只记录，不触发任何重启。
           set -u
-
-          TAG=routeros-bypass-health
-          LOCK=/var/run/routeros-bypass-health.lock
-          LOG=/var/log/routeros-bypass-health.log
-          FAIL=/tmp/routeros-bypass-health.fail
-          COOL=/tmp/routeros-bypass-health.cooldown
+          TAG=bypass-health
+          LOCK=/var/run/bypass-health.lock
+          LOG=/var/log/bypass-health.log
+          FAIL=/tmp/bypass-health.fail
+          COOL=/tmp/bypass-health.cooldown
           MAX=5242880
 
           mkdir "$LOCK" 2>/dev/null || exit 0
           trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 
           log() {
-            line="$(date '+%F %T') $*"
             logger -t "$TAG" -- "$*"
-            printf '%s\n' "$line" >> "$LOG"
+            printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
             [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$MAX" ] && tail -c 2621440 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
           }
 
@@ -607,6 +672,7 @@ jobs:
             exit 0
           fi
 
+          # 本地 DNS 链探针：收到任何应答(含 NXDOMAIN)即视为链路正常；只有超时/拒绝才算故障
           probe_ok=1
           if command -v nslookup >/dev/null 2>&1; then
             out="$(timeout 6 nslookup www.baidu.com 127.0.0.1 2>&1 || true)"
@@ -631,210 +697,338 @@ jobs:
 
           if command -v curl >/dev/null 2>&1; then
             curl -4 -fsS -I --max-time 8 https://tvbbox.pgjgr.eu.cc/ >/dev/null 2>&1 \
-              && log "OKTV remote HTTPS check: PASS" \
-              || log "OKTV remote HTTPS check: FAIL (observation only)"
+              && log "OKTV remote HTTPS check: PASS" || log "OKTV remote HTTPS check: FAIL (observation only)"
             curl -4 -fsS --max-time 8 https://www.gstatic.com/generate_204 >/dev/null 2>&1 \
-              && log "Google 204 check: PASS" \
-              || log "Google 204 check: FAIL (observation only)"
+              && log "Google 204 check: PASS" || log "Google 204 check: FAIL (observation only)"
           fi
-          EOF
-          chmod 755 files/usr/bin/routeros-bypass-health
+          __PACK_EOF__
+          put 'files/root/BYPASS-README.txt' 644 <<'__PACK_EOF__'
+          iStoreOS x86_64 旁路由固件（GitHub Actions 构建）
 
-          # Init 服务：应用 sysctl、启用 BBR、动态分配连接跟踪容量
-          cat > files/etc/init.d/routeros-bypass-v2 <<'EOF'
-          #!/bin/sh /etc/rc.common
-          START=95
-          STOP=05
-          USE_PROCD=0
+          - IPv4-only 基线；本机 DHCP/RA/DHCPv6 关闭（由 RouterOS 主路由负责）。
+          - OpenClash 为主控：dnsmasq :53 -> 127.0.0.1:1053（仅在存在可用 YAML 后才改 DNS，且 cachesize=0）。
+          - Flow Offloading 关闭；BBR（构建时启用且内核支持）；TCP/UDP 缓冲 16MB；conntrack 超时收紧。
+          - OK影视直连规则：hidns.vip / cmliussss.com / 090227.xyz / tvbbox.pgjgr.eu.cc。
+          - 健康检查：连续 2 次本地 DNS 探测失败才重启 OpenClash，15 分钟冷却。
 
-          start() {
-            sysctl -e -q -p /etc/sysctl.d/98-routeros-bypass-v2.conf >/dev/null 2>&1 || true
+          常用命令：
+            bypass-apply apply     重新应用基线
+            bypass-apply direct    回滚：恢复直连 DNS 并停止 OpenClash
+            bypass-health          手动执行一次健康检查（日志 /var/log/bypass-health.log）
+            sysctl net.ipv4.tcp_congestion_control
+          __PACK_EOF__
 
-            if [ -f /etc/routeros-bypass/bbr ]; then
-              modprobe tcp_bbr >/dev/null 2>&1 || true
-              avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-              case " $avail " in
-                *" bbr "*)
-                  sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-                  logger -t routeros-bypass-v2 "BBR enabled"
-                  ;;
-                *) logger -t routeros-bypass-v2 "BBR not available in this kernel; keeping default" ;;
-              esac
-            fi
-
-            mem_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 2048)
-            if [ "$mem_mb" -ge 6144 ]; then
-              max=262144
-            elif [ "$mem_mb" -ge 3072 ]; then
-              max=131072
+      - name: Materialize build configs (standalone mode)
+        shell: bash
+        run: |
+          set -euo pipefail
+          put() {  # put 目标路径 权限   （内容来自 stdin；目标已存在则保留仓库版本）
+            local dest="$1" mode="$2"
+            if [ -e "$dest" ]; then
+              cat > /dev/null; echo "[keep ] $dest (仓库已有，使用仓库版本)"
             else
-              max=65536
+              mkdir -p "$(dirname "$dest")"; cat > "$dest"; chmod "$mode" "$dest"; echo "[write] $dest"
             fi
-            sysctl -w "net.netfilter.nf_conntrack_max=$max" >/dev/null 2>&1 || true
+          }
+          put 'configs/overlay.config' 644 <<'__PACK_EOF__'
+          # overlay.config —— 叠加在“官方 config.seed”之上的自定义项（后出现者覆盖种子）。
+          # 只写你想额外启用/关闭的东西；包不存在时 defconfig 会忽略（不会报错）。
 
-            logger -t routeros-bypass-v2 "baseline loaded; conntrack_max=$max"
-            /usr/bin/routeros-bypass-apply apply >/dev/null 2>&1 || true
+          # 旁路由 + OpenClash 运行依赖
+          CONFIG_PACKAGE_dnsmasq-full=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_ca-certificates=y
+
+          # 诊断工具
+          CONFIG_PACKAGE_tcpdump=y
+          CONFIG_PACKAGE_ethtool=y
+          CONFIG_PACKAGE_iperf3=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_jq=y
+          CONFIG_PACKAGE_bind-dig=y
+
+          # PVE 虚拟机：QEMU Guest Agent
+          CONFIG_PACKAGE_qemu-ga=y
+
+          # 想关闭官方带的某个包，写成：
+          # # CONFIG_PACKAGE_某包名 is not set
+          __PACK_EOF__
+          put 'configs/fallback.seed' 644 <<'__PACK_EOF__'
+          # fallback.seed —— 官方 config.seed 下载失败（或 config_source=repo 且未提供 configs/base.seed）时使用的最小种子。
+          # 这是“能编出可用 x86_64 EFI 镜像”的保底配置，不等价于官方固件的完整功能集合。
+          # 想完全复刻官方：把官方 config.seed 保存为 configs/base.seed 即可（见 README）。
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          CONFIG_GRUB_IMAGES=y
+          CONFIG_GRUB_EFI_IMAGES=y
+          CONFIG_TARGET_KERNEL_PARTSIZE=16
+          CONFIG_TARGET_ROOTFS_PARTSIZE=4096
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_TARGET_IMAGES_GZIP=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_PACKAGE_block-mount=y
+          CONFIG_PACKAGE_e2fsprogs=y
+          CONFIG_PACKAGE_kmod-e1000e=y
+          CONFIG_PACKAGE_kmod-igb=y
+          CONFIG_PACKAGE_kmod-igc=y
+          CONFIG_PACKAGE_kmod-r8169=y
+          CONFIG_PACKAGE_kmod-vmxnet3=y
+          CONFIG_PACKAGE_kmod-virtio-net=y
+          # iStoreOS 特色组件（包名以官方源码树为准；不存在会被忽略）
+          CONFIG_PACKAGE_istoreos-files=y
+          CONFIG_PACKAGE_luci-app-quickstart=y
+          CONFIG_PACKAGE_luci-app-store=y
+          __PACK_EOF__
+
+      - name: Validate inputs
+        shell: bash
+        env:
+          IN_BASE_URL: ${{ inputs.official_base_url }}
+          IN_PARTSIZE: ${{ inputs.rootfs_partsize }}
+          IN_THRESHOLD: ${{ inputs.retention_fail_threshold }}
+          IN_VERSION: ${{ inputs.openclash_version }}
+          IN_PKGS: ${{ inputs.custom_packages }}
+          IN_IP: ${{ inputs.lan_ipaddr }}
+          IN_MASK: ${{ inputs.lan_netmask }}
+          IN_GW: ${{ inputs.lan_gateway }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$IN_BASE_URL" | grep -Eq '^https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$' \
+            || { echo "::error::official_base_url 必须是 https:// 开头的合法 URL"; exit 1; }
+          printf '%s' "$IN_PARTSIZE" | grep -Eq '^[0-9]{3,5}$' && [ "$IN_PARTSIZE" -ge 256 ] && [ "$IN_PARTSIZE" -le 16384 ] \
+            || { echo "::error::rootfs_partsize 必须是 256~16384 的整数"; exit 1; }
+          printf '%s' "$IN_THRESHOLD" | grep -Eq '^[0-9]{1,4}$' \
+            || { echo "::error::retention_fail_threshold 必须是非负整数"; exit 1; }
+          printf '%s' "$IN_VERSION" | grep -Eq '^[0-9A-Za-z._-]+$' \
+            || { echo "::error::openclash_version 含非法字符"; exit 1; }
+          if [ -n "$IN_PKGS" ] && ! printf '%s' "$IN_PKGS" | grep -Eq '^[A-Za-z0-9._+ -]+$'; then
+            echo "::error::custom_packages 只能包含字母数字 . _ + - 和空格"; exit 1
+          fi
+          ipre='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+          for v in "$IN_IP" "$IN_GW"; do
+            if [ -n "$v" ] && ! printf '%s' "$v" | grep -Eq "$ipre"; then echo "::error::非法 IPv4 地址: $v"; exit 1; fi
+          done
+          if [ -n "$IN_IP" ] && ! printf '%s' "$IN_MASK" | grep -Eq "$ipre"; then echo "::error::非法子网掩码: $IN_MASK"; exit 1; fi
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git \
+            libncurses-dev libssl-dev python3 python3-dev python3-setuptools python3-pyelftools \
+            rsync swig unzip zlib1g-dev file wget curl libelf-dev zstd device-tree-compiler \
+            xsltproc qemu-utils ccache xz-utils patch perl tar gzip bzip2 p7zip-full time
+
+      - name: Fetch official build inputs
+        if: inputs.config_source == 'official'
+        shell: bash
+        env:
+          BASE_URL: ${{ inputs.official_base_url }}
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-official.sh "$BASE_URL" "$GITHUB_WORKSPACE/$INPUTS_DIR"
+          echo '----- status.env -----'
+          cat "$GITHUB_WORKSPACE/$INPUTS_DIR/status.env"
+          cat "$GITHUB_WORKSPACE/$INPUTS_DIR/status.env" >> "$GITHUB_ENV"
+          if [ "$(grep -c '^OFFICIAL_SEED=1' "$GITHUB_WORKSPACE/$INPUTS_DIR/status.env" || true)" -eq 0 ]; then
+            echo "::warning::未能取得有效的官方 config.seed，将回退到仓库种子（功能集合可能小于官方固件）。"
+          fi
+
+      - name: Clone iStoreOS source
+        shell: bash
+        env:
+          BRANCH: ${{ inputs.branch }}
+          PIN: ${{ inputs.pin_official_commit }}
+        run: |
+          set -euo pipefail
+          # 无文件内容的“treeless”克隆：保留完整提交历史（用于校验/锁定官方提交），体积小
+          git clone --filter=blob:none --no-checkout --branch "$BRANCH" "$ISTOREOS_REPO" "$SRC_DIR"
+          cd "$SRC_DIR"
+          ref="origin/$BRANCH"
+          if [ "$PIN" = 'true' ] && [ "${OFFICIAL_SEED:-0}" = '1' ] && [ -n "${OFFICIAL_COMMIT:-}" ]; then
+            if git cat-file -e "${OFFICIAL_COMMIT}^{commit}" 2>/dev/null \
+               && git merge-base --is-ancestor "$OFFICIAL_COMMIT" "origin/$BRANCH"; then
+              ref="$OFFICIAL_COMMIT"
+              echo "[OK] 锁定到官方构建提交 $OFFICIAL_COMMIT"
+            else
+              echo "::error::官方 commit.buildinfo ($OFFICIAL_COMMIT) 不在分支 $BRANCH 的历史中："
+              echo "::error::说明官方目录里的 config.seed 属于别的分支。请改选正确的分支/official_base_url，"
+              echo "::error::或把 pin_official_commit 关掉（此时种子配置与源码可能不严格匹配）。"
+              exit 1
+            fi
+          fi
+          git checkout -q --detach "$ref"
+          git log -1 --format='source: %H  %cd  %s'
+
+      - name: Restore downloaded source archives
+        uses: actions/cache/restore@v4
+        with:
+          path: istoreos/dl
+          key: istoreos-dl-${{ inputs.branch }}-${{ github.run_id }}
+          restore-keys: |
+            istoreos-dl-${{ inputs.branch }}-
+
+      - name: Update and install feeds
+        working-directory: istoreos
+        shell: bash
+        env:
+          FEEDS_MODE: ${{ inputs.feeds_mode }}
+        run: |
+          set -euo pipefail
+          run_update() {
+            for attempt in 1 2 3; do
+              ./scripts/feeds update -a && return 0
+              echo "[WARN] feeds update attempt ${attempt} failed"; sleep 10
+            done
+            return 1
+          }
+          check_base() {
+            for base in packages luci; do
+              [ -d "feeds/${base}" ] && [ -n "$(ls -A "feeds/${base}" 2>/dev/null)" ] \
+                || { echo "::error::基础 feed '${base}' 不可用"; return 1; }
+            done
           }
 
-          stop() { :; }
-          EOF
-          chmod 755 files/etc/init.d/routeros-bypass-v2
+          rm -f feeds.conf
+          used=default
+          if [ "$FEEDS_MODE" = 'official-pinned' ] && [ "${OFFICIAL_FEEDS:-0}" = '1' ]; then
+            cp "$GITHUB_WORKSPACE/$INPUTS_DIR/feeds.pinned" feeds.conf
+            used=official-pinned
+            echo '===== feeds.conf (official, pinned) ====='; cat feeds.conf
+          fi
 
-          # 开机初次配置引导
-          cat > files/etc/uci-defaults/99-routeros-bypass-v2 <<'EOF'
-          #!/bin/sh
-          set -u
-
-          [ -f /etc/routeros-bypass/lan.conf ] && . /etc/routeros-bypass/lan.conf
-          LAN_IP="${LAN_IP:-}"; LAN_MASK="${LAN_MASK:-255.255.255.0}"; LAN_GW="${LAN_GW:-}"
-
-          if [ -n "$LAN_IP" ] && uci -q get network.lan >/dev/null 2>&1; then
-            uci set network.lan.proto='static'
-            uci set network.lan.ipaddr="$LAN_IP"
-            uci set network.lan.netmask="$LAN_MASK"
-            if [ -n "$LAN_GW" ]; then
-              uci set network.lan.gateway="$LAN_GW"
-              uci -q delete network.lan.dns
-              uci add_list network.lan.dns="$LAN_GW"
+          if ! { run_update && check_base; }; then
+            if [ "$used" = 'official-pinned' ]; then
+              echo "::warning::官方锁定的 feeds 拉取失败（提交可能已被清理），回退到源码树自带 feeds.conf.default"
+              rm -rf feeds tmp feeds.conf
+              run_update && check_base || { echo "::error::feeds 更新失败"; exit 1; }
+            else
+              echo "::error::feeds 更新失败"; exit 1
             fi
-            uci -q delete network.lan.ip6assign
           fi
+          ./scripts/feeds install -a || echo '[WARN] feeds install -a returned non-zero'
 
-          if uci -q get network.globals >/dev/null 2>&1; then
-            uci set network.globals.packet_steering='1'
+      - name: Pin OpenClash source
+        if: inputs.enable_openclash == true
+        working-directory: istoreos
+        shell: bash
+        env:
+          OC_VERSION: ${{ inputs.openclash_version }}
+        run: |
+          set -euxo pipefail
+          # 移除 feed 里可能存在的同名 OpenClash，避免两个版本互相覆盖
+          find feeds -maxdepth 3 -name luci-app-openclash -prune -exec rm -rf {} + || true
+          find package/feeds -maxdepth 2 -name luci-app-openclash -exec rm -rf {} + || true
+          rm -rf package/openclash
+          git clone --branch "v${OC_VERSION}" --single-branch --depth 1 \
+            https://github.com/vernesong/OpenClash.git package/openclash
+          find package/openclash -maxdepth 2 -type f -name Makefile -print -quit | grep -q .
+
+      - name: Assemble .config (seed + overlay + inputs)
+        working-directory: istoreos
+        shell: bash
+        env:
+          ROOTFS_TYPE: ${{ inputs.rootfs_type }}
+          ROOTFS_PARTSIZE: ${{ inputs.rootfs_partsize }}
+          ENABLE_BBR: ${{ inputs.enable_bbr }}
+          ENABLE_OPENCLASH: ${{ inputs.enable_openclash }}
+          CUSTOM_PACKAGES: ${{ inputs.custom_packages }}
+        run: |
+          set -euo pipefail
+          if [ "${OFFICIAL_SEED:-0}" = '1' ]; then
+            seed="$GITHUB_WORKSPACE/$INPUTS_DIR/base.seed"; mode=strict
+            echo "[INFO] 种子配置：官方 ${OFFICIAL_SEED_NAME:-config.seed}"
+          elif [ -s "$GITHUB_WORKSPACE/configs/base.seed" ]; then
+            seed="$GITHUB_WORKSPACE/configs/base.seed"; mode=strict
+            echo "[INFO] 种子配置：仓库 configs/base.seed"
+          else
+            seed="$GITHUB_WORKSPACE/configs/fallback.seed"; mode=warn
+            echo "::warning::使用最小回退种子 configs/fallback.seed，功能集合小于官方固件。"
           fi
-          uci commit network 2>/dev/null || true
+          echo "SEED_FILE=$seed" >> "$GITHUB_ENV"
+          echo "RETENTION_MODE=$mode" >> "$GITHUB_ENV"
 
-          if uci -q get dhcp.lan >/dev/null 2>&1; then
-            uci set dhcp.lan.ignore='1'
-            uci set dhcp.lan.ra='disabled'
-            uci set dhcp.lan.dhcpv6='disabled'
-            uci set dhcp.lan.ndp='disabled'
-          fi
+          bash "$GITHUB_WORKSPACE/scripts/assemble-config.sh" "$seed" "$GITHUB_WORKSPACE/configs/overlay.config"
+          cp .config .config.assembled
+          make defconfig
 
-          for s in $(uci show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=odhcpd$/\1/p'); do
-            uci set "dhcp.${s}.ra=disabled" 2>/dev/null || true
-            uci set "dhcp.${s}.dhcpv6=disabled" 2>/dev/null || true
-            uci set "dhcp.${s}.ndp=disabled" 2>/dev/null || true
-          done
+      - name: Resolve package file conflicts and check retention
+        working-directory: istoreos
+        shell: bash
+        env:
+          THRESHOLD: ${{ inputs.retention_fail_threshold }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/resolve-conflicts.sh"
+          MODE="$RETENTION_MODE" bash "$GITHUB_WORKSPACE/scripts/check-retention.sh" "$SEED_FILE"
 
-          if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
-            uci set firewall.@defaults[0].flow_offloading='0'
-            uci set firewall.@defaults[0].flow_offloading_hw='0'
-          fi
-
-          uci commit dhcp 2>/dev/null || true
-          uci commit firewall 2>/dev/null || true
-
-          if uci -q get openclash.config >/dev/null 2>&1; then
-            uci set openclash.config.enable_custom_clash_rules='1' 2>/dev/null || true
-            uci set openclash.config.enable_respect_rules='1' 2>/dev/null || true
-            uci set openclash.config.enable_redirect_dns='1' 2>/dev/null || true
-            uci set openclash.config.en_mode='fake-ip-tun' 2>/dev/null || true
-            uci set openclash.config.stack_type='mixed' 2>/dev/null || true
-            uci set openclash.config.disable_masq_cache='1' 2>/dev/null || true
-            uci set openclash.config.skip_proxy_address='1' 2>/dev/null || true
-            uci set openclash.config.ipv6_enable='0' 2>/dev/null || true
-            if [ -x /etc/openclash/core/clash_meta ]; then
-              uci set openclash.config.core_type='Meta' 2>/dev/null || true
-            fi
-            uci commit openclash || true
-          fi
-
-          for s in /etc/init.d/openbox /etc/init.d/open-box; do
-            if [ -x "$s" ]; then
-              "$s" stop >/dev/null 2>&1 || true
-              "$s" disable >/dev/null 2>&1 || true
-            fi
-          done
-
-          /etc/init.d/routeros-bypass-v2 enable >/dev/null 2>&1 || true
-
-          CRON=/etc/crontabs/root
-          touch "$CRON"
-          grep -q '/usr/bin/routeros-bypass-health' "$CRON" 2>/dev/null || \
-            echo '*/5 * * * * /usr/bin/routeros-bypass-health >/dev/null 2>&1' >> "$CRON"
-          /etc/init.d/cron enable >/dev/null 2>&1 || true
-
-          rm -f /etc/uci-defaults/99-routeros-bypass-v2
-          exit 0
-          EOF
-          chmod 755 files/etc/uci-defaults/99-routeros-bypass-v2
-
-          cat > files/root/openbox-install-latest.sh <<'EOF'
-          #!/bin/sh
-          set -eu
-          dest=/tmp/openbox-install.sh
-          urls="\
-          https://gh-proxy.org/https://raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/install.sh \
-          https://gh-proxy.com/raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/install.sh \
-          https://ghproxy.net/raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/install.sh \
-          https://ghfast.top/raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/install.sh"
-          ok=0
-          for u in $urls; do
-            if curl -4 -L --fail --connect-timeout 10 --max-time 120 -o "$dest" "$u"; then
-              if head -n 1 "$dest" | grep -q '^#!/bin/sh$' && grep -q 'REPO="liandu2024/Open-Box"' "$dest"; then
-                ok=1
-                break
-              fi
-            fi
-          done
-          [ "$ok" -eq 1 ] || { echo 'Open-Box installer download failed.' >&2; exit 1; }
-          chmod 700 "$dest"
-          exec sh "$dest" --mirror --port 3036
-          EOF
-          chmod 700 files/root/openbox-install-latest.sh
-
-          cat > files/root/ROUTEROS-BYPASS-V2-README.txt <<'EOF'
-          iStoreOS 24.10.8 RouterOS 主路由 + 旁路由 V2.2
-
-          Fixed/static:
-          - IPv4-only policy on the bypass router; DHCP/RA/DHCPv6 off.
-          - OpenClash primary DNS/TUN controller; dnsmasq :53 -> 127.0.0.1:1053.
-          - Fake-IP-TUN baseline, mixed stack, respect-rules and custom rules.
-          - Flow offloading is disabled.
-          - OKTV direct rules: hidns.vip / cmliussss.com / 090227.xyz / tvbbox.pgjgr.eu.cc
-          - TCP/UDP buffers up to 16MB, BBR, conntrack timeouts tuned.
-
-          Useful commands:
-          routeros-bypass-apply apply
-          routeros-bypass-apply direct
-          routeros-bypass-health
-          sysctl net.ipv4.tcp_congestion_control
-          EOF
+      - name: Inject rootfs overlay
+        working-directory: istoreos
+        shell: bash
+        env:
+          ENABLE_BBR: ${{ inputs.enable_bbr }}
+          IN_IP: ${{ inputs.lan_ipaddr }}
+          IN_MASK: ${{ inputs.lan_netmask }}
+          IN_GW: ${{ inputs.lan_gateway }}
+        run: |
+          set -euo pipefail
+          rm -rf files && mkdir -p files
+          cp -a "$GITHUB_WORKSPACE/files/." files/
+          # 兼容在 Windows 上编辑后带 CRLF 的脚本
+          find files -type f -exec sed -i 's/\r$//' {} +
+          chmod 755 files/usr/bin/* files/etc/init.d/* files/etc/uci-defaults/*
+          mkdir -p files/etc/routeros-bypass
+          [ "$ENABLE_BBR" = 'true' ] && echo 1 > files/etc/routeros-bypass/bbr
+          {
+            echo "LAN_IP='${IN_IP}'"
+            echo "LAN_MASK='${IN_MASK}'"
+            echo "LAN_GW='${IN_GW}'"
+          } > files/etc/routeros-bypass/lan.conf
+          grep -q '^rules:' files/etc/openclash/custom/openclash_custom_rules.list
+          find files -type f | sort
 
       - name: Preload Mihomo core and geodata (best effort)
-        if: inputs.preload_openclash_core == true
+        if: inputs.enable_openclash == true && inputs.preload_openclash_core == true
         working-directory: istoreos
         shell: bash
         run: |
           set -uo pipefail
           mkdir -p files/etc/openclash/core
           tmp="$(mktemp -d)"
-
-          fetch() {
-            for i in 1 2 3; do
-              curl -fL --retry 2 --connect-timeout 15 --max-time 300 -o "$2" "$1" && return 0
-              sleep 5
-            done
-            return 1
-          }
+          fetch() { for i in 1 2 3; do curl -fL --retry 2 --connect-timeout 15 --max-time 300 -o "$2" "$1" && return 0; sleep 5; done; return 1; }
 
           core_ok=0
           for url in \
             "https://raw.githubusercontent.com/vernesong/OpenClash/core/master/meta/clash-linux-amd64.tar.gz" \
             "https://github.com/vernesong/OpenClash/raw/core/master/meta/clash-linux-amd64.tar.gz"; do
             if fetch "$url" "$tmp/core.tar.gz" && tar -xzf "$tmp/core.tar.gz" -C "$tmp" 2>/dev/null; then
-              bin="$(find "$tmp" -maxdepth 2 -type f \( -name 'clash' -o -name 'clash_meta' -o -name 'mihomo' \) | head -n 1)"
+              bin="$(find "$tmp" -maxdepth 2 -type f \( -name clash -o -name clash_meta -o -name mihomo \) | head -n 1)"
               if [ -n "$bin" ] && chmod +x "$bin" && "$bin" -v 2>&1 | head -n 1 | grep -qi 'meta\|mihomo'; then
                 install -m 755 "$bin" files/etc/openclash/core/clash_meta
                 echo "[OK] core preloaded: $(files/etc/openclash/core/clash_meta -v 2>&1 | head -n 1)"
-                core_ok=1
-                break
+                core_ok=1; break
               fi
             fi
           done
-          [ "$core_ok" -eq 1 ] || echo '[WARN] Mihomo core not preloaded; OpenClash will download it in LuCI on first run.'
+          [ "$core_ok" -eq 1 ] || echo '[WARN] Mihomo core not preloaded; OpenClash will download it on first run.'
 
           for f in geoip.dat geosite.dat country.mmdb; do
             url="https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/${f}"
@@ -852,34 +1046,28 @@ jobs:
           rm -rf "$tmp"
           exit 0
 
-      - name: Finalize config and verify required target
+      - name: Finalize config and verify
         working-directory: istoreos
         shell: bash
+        env:
+          ENABLE_OPENCLASH: ${{ inputs.enable_openclash }}
+          PARTSIZE: ${{ inputs.rootfs_partsize }}
         run: |
           set -euo pipefail
           make defconfig
+          bash "$GITHUB_WORKSPACE/scripts/resolve-conflicts.sh" --check-only
 
           echo '===== TARGET CHECK ====='
-          grep -E '^(CONFIG_TARGET_x86_64_DEVICE_generic|CONFIG_TARGET_ROOTFS_EXT4FS|CONFIG_TARGET_ROOTFS_PARTSIZE|CONFIG_GRUB_EFI_IMAGES|CONFIG_PACKAGE_luci-app-openclash|CONFIG_PACKAGE_kmod-tcp-bbr)=' .config || true
-
-          echo '===== OPENCLASH CHECK ====='
-          grep -n '^PKG_VERSION' package/openclash/luci-app-openclash/Makefile | head -n 1
+          grep -E '^(CONFIG_TARGET_x86_64_DEVICE_generic|CONFIG_TARGET_ROOTFS_SQUASHFS|CONFIG_TARGET_ROOTFS_EXT4FS|CONFIG_TARGET_ROOTFS_PARTSIZE|CONFIG_GRUB_EFI_IMAGES|CONFIG_PACKAGE_luci-app-openclash|CONFIG_PACKAGE_kmod-tcp-bbr)=' .config || true
 
           test "$(grep -c '^CONFIG_TARGET_x86_64_DEVICE_generic=y' .config || true)" -eq 1
-          test "$(grep -c '^CONFIG_TARGET_ROOTFS_PARTSIZE=4096' .config || true)" -eq 1
+          test "$(grep -c "^CONFIG_TARGET_ROOTFS_PARTSIZE=${PARTSIZE}\$" .config || true)" -eq 1
           test "$(grep -c '^CONFIG_GRUB_EFI_IMAGES=y' .config || true)" -eq 1
-          test "$(grep -c '^CONFIG_PACKAGE_luci-app-openclash=y' .config || true)" -eq 1
-          test -f files/etc/uci-defaults/99-routeros-bypass-v2
-          test -f files/usr/bin/routeros-bypass-health
-          grep -q '^rules:' files/etc/openclash/custom/openclash_custom_rules.list
-
-          for pair in libustream-mbedtls:libustream-openssl tcpdump:tcpdump-mini dnsmasq-full:dnsmasq ip-full:ip-tiny wget-ssl:wget-nossl; do
-            a="${pair%%:*}"; b="${pair##*:}"
-            if grep -q "^CONFIG_PACKAGE_${a}=y" .config && grep -q "^CONFIG_PACKAGE_${b}=y" .config; then
-              echo "::error::冲突: ${a} + ${b}"; exit 1
-            fi
-          done
-          echo '[OK] final config verified'
+          if [ "$ENABLE_OPENCLASH" = 'true' ]; then
+            test "$(grep -c '^CONFIG_PACKAGE_luci-app-openclash=y' .config || true)" -eq 1
+            grep -n '^PKG_VERSION' package/openclash/luci-app-openclash/Makefile | head -n 1
+          fi
+          echo "[OK] final config verified; =y packages: $(grep -c '^CONFIG_PACKAGE_.*=y$' .config)"
 
       - name: Download all sources
         working-directory: istoreos
@@ -889,6 +1077,7 @@ jobs:
         run: |
           set -euo pipefail
           make -j"$(nproc)" download V=s || make -j1 download V=s
+          # 清理体积过小的残缺下载，避免校验失败
           find dl -size -1024c -exec ls -l {} \; -exec rm -f {} \; || true
 
       - name: Save downloaded source archives
@@ -896,18 +1085,19 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: istoreos/dl
-          key: istoreos-dl-${{ env.ISTOREOS_VERSION }}-${{ github.run_id }}
+          key: istoreos-dl-${{ inputs.branch }}-${{ github.run_id }}
 
-      - name: Build iStoreOS image
+      - name: Build firmware
         working-directory: istoreos
         env:
           FORCE_UNSAFE_CONFIGURE: '1'
         shell: bash
         run: |
           set -euo pipefail
-          if ! make -j"$(nproc)" world V=s 2>&1 | tee ../build.log; then
+          # 首轮并行编译；失败则单线程重跑，使日志里直接显示真正的首个错误
+          if ! make -j"$(nproc)" V=s 2>&1 | tee ../build.log; then
             echo '===== 并行构建失败，单线程重试以定位首个错误 ====='
-            make -j1 world V=s 2>&1 | tee ../build-retry.log
+            make -j1 V=s 2>&1 | tee ../build-retry.log
           fi
 
       - name: Show image-assembly diagnostics on failure
@@ -918,44 +1108,42 @@ jobs:
             [ -f "$f" ] || continue
             echo "===== $f: clashes / errors ====="
             grep -n -B2 -A8 'check_data_file_clashes' "$f" | head -n 80 || true
-            grep -n -E 'Error [0-9]+|\* ERROR|Collected errors' "$f" | head -n 40 || true
+            grep -n -E 'Error [0-9]+|\* ERROR|ERROR:|Collected errors' "$f" | head -n 40 || true
           done
 
       - name: Collect firmware and diagnostics
         shell: bash
         run: |
           set -euo pipefail
+          tdir="$(find "$SRC_DIR/bin/targets" -mindepth 2 -maxdepth 2 -type d | head -n 1)"
+          [ -n "$tdir" ] || { echo "::error::找不到 bin/targets 产物目录"; exit 1; }
           mkdir -p out
-          cp -a istoreos/bin/targets/x86/64/* out/
+          cp -a "$tdir"/* out/
           rm -rf out/packages
-
+          ls out/*.img.gz >/dev/null 2>&1 || { echo "::error::没有生成 .img.gz 镜像"; exit 1; }
           {
-            echo "Distribution=iStoreOS"
-            echo "Version=${ISTOREOS_VERSION}"
-            echo "Profile=x86_64 generic EFI"
-            echo "ROOTFS_PARTSIZE=${ROOTFS_PARTSIZE} MiB"
-            echo "OpenClash=${OPENCLASH_VERSION}"
-            echo "V2=${V2_VERSION}"
-            echo "BackupProxy=${{ inputs.enable_backup_proxy }}"
-            echo "ExtraProxyStacks=${{ inputs.enable_extra_proxy_stacks }}"
+            echo "Pack=${PACK_VERSION}"
+            echo "Branch=${{ inputs.branch }}"
+            echo "ConfigSource=${{ inputs.config_source }} (official seed used: ${OFFICIAL_SEED:-0})"
+            echo "OfficialCommit=${OFFICIAL_COMMIT:-none}  pinned=${{ inputs.pin_official_commit }}"
+            echo "FeedsMode=${{ inputs.feeds_mode }}"
+            echo "RootfsType=${{ inputs.rootfs_type }}  PartSize=${{ inputs.rootfs_partsize }} MiB"
+            echo "OpenClash=${{ inputs.enable_openclash }} ${{ inputs.openclash_version }}  PreloadCore=${{ inputs.preload_openclash_core }}"
             echo "BBR=${{ inputs.enable_bbr }}"
-            echo "PreloadCore=${{ inputs.preload_openclash_core }}"
-            echo "WorkflowRun=${GITHUB_RUN_ID}"
-            echo "WorkflowRunNumber=${GITHUB_RUN_NUMBER}"
+            echo "SourceHead=$(git -C "$SRC_DIR" rev-parse HEAD)"
+            echo "WorkflowRun=${GITHUB_RUN_ID} #${GITHUB_RUN_NUMBER}"
           } > out/build-info.txt
-
-          cp istoreos/.config out/build.config
-          (cd out && sha256sum ./*.img* ./*.gz ./*.bin 2>/dev/null || true) > out/sha256sums.txt
+          cp "$SRC_DIR/.config" out/build.config
+          [ -f "$SRC_DIR/.resolver-dropped" ] && cp "$SRC_DIR/.resolver-dropped" out/resolver-dropped.txt || true
+          (cd out && sha256sum ./*.img.gz ./*.manifest 2>/dev/null || true) > out/sha256sums.txt
           ls -lah out
-          echo '===== BUILD INFO ====='
           cat out/build-info.txt
-          echo '===== SHA256 ====='
           cat out/sha256sums.txt
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: istoreos-24.10.8-x86_64-4G-efi-routeros-bypass-v2
+          name: istoreos-${{ inputs.branch }}-x86_64-bypass
           path: out/*
           if-no-files-found: error
           retention-days: 14
@@ -969,6 +1157,9 @@ jobs:
             build.log
             build-retry.log
             istoreos/.config
+            istoreos/.config.assembled
+            istoreos/.resolver-dropped
+            build-inputs/status.env
           if-no-files-found: ignore
           retention-days: 7
 
@@ -976,10 +1167,10 @@ jobs:
         if: inputs.publish_release == true
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "istoreos-24.10.8-bypass-v2-${{ github.run_number }}"
-          name: "iStoreOS 24.10.8 RouterOS Bypass V2.2 #${{ github.run_number }}"
+          tag_name: "istoreos-${{ inputs.branch }}-x86_64-${{ github.run_number }}"
+          name: "iStoreOS ${{ inputs.branch }} x86_64 bypass #${{ github.run_number }}"
           files: |
-            out/*.gz
+            out/*.img.gz
             out/*.txt
             out/*.manifest
             out/build.config
