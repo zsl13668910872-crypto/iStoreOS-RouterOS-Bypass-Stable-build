@@ -1,0 +1,154 @@
+# ===== 单文件版（由 scripts/make-standalone.py 生成，请勿手工编辑；改动请改源文件后重新生成）=====
+# 只需把本文件放到仓库的 .github/workflows/ 下即可使用。
+# 前面的 Materialize 步骤会把 scripts/、files/、configs/ 里的文件写入工作区；
+# 仓库里已有的同名文件优先（可逐个覆盖定制）。
+name: Publish release from an existing build run
+
+# 固件已经编好（Artifacts 里有），只是发布 Release 失败时用：不需要重新编译。
+# 用法：在失败/成功的编译运行页，复制网址末尾的数字（run id），填到下面再运行。
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '已完成编译的运行 ID（运行页网址 .../actions/runs/<这串数字>）'
+        required: true
+        type: string
+      tag:
+        description: '可选：Release 的 tag（留空则自动按 build-info 生成，如 istoreos-25.12-x86_64-2）'
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: '标记为预发布'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this repo (scripts)
+        uses: actions/checkout@v4
+
+      - name: Materialize publish script (standalone mode)
+        shell: bash
+        run: |
+          set -euo pipefail
+          put() {  # put 目标路径 权限   （内容来自 stdin；目标已存在则保留仓库版本）
+            local dest="$1" mode="$2"
+            if [ -e "$dest" ]; then
+              cat > /dev/null; echo "[keep ] $dest (仓库已有，使用仓库版本)"
+            else
+              mkdir -p "$(dirname "$dest")"; cat > "$dest"; chmod "$mode" "$dest"; echo "[write] $dest"
+            fi
+          }
+          put 'scripts/publish-release.sh' 755 <<'__PACK_EOF__'
+          #!/bin/bash
+          # publish-release.sh ASSET_DIR TAG TITLE [--prerelease]
+          # 把编译产物发布为 GitHub Release（用 gh CLI；runner 自带）。需要环境变量 GH_TOKEN、GH_REPO。
+          # 之所以自己处理而不用第三方 action，是因为要在上传前做这些检查：
+          #   * GitHub 拒绝 0 字节的 Release 资产（"size must be greater than or equal to 1"），空文件必须先剔除
+          #   * 至少要有一个 .img.gz 镜像；单个文件不得超过 2GiB
+          #   * Release 已存在（上次失败留下的半成品）时，改为 upload --clobber 补传，而不是报“已存在”
+          #   * 网络抖动自动重试
+          set -euo pipefail
+          DIR="${1:?用法: publish-release.sh ASSET_DIR TAG TITLE [--prerelease]}"
+          TAG="${2:?TAG}"; TITLE="${3:?TITLE}"; PRE="${4:-}"
+          [ -d "$DIR" ] || { echo "::error::目录不存在: $DIR"; exit 1; }
+          printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "::error::tag 含非法字符: $TAG"; exit 1; }
+
+          pat=( \( -name '*.img.gz' -o -name '*.txt' -o -name '*.manifest' -o -name 'build.config' \) )
+          while IFS= read -r f; do
+            echo "[WARN] 跳过 0 字节文件（GitHub 不接受空资产）: $(basename "$f")"
+          done < <(find "$DIR" -maxdepth 1 -type f "${pat[@]}" -size 0 | sort)
+
+          mapfile -t files < <(find "$DIR" -maxdepth 1 -type f "${pat[@]}" -size +0c | sort)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::没有可上传的非空文件"; exit 1; }
+          printf '%s\n' "${files[@]}" | grep -q '\.img\.gz$' || { echo "::error::资产里没有 .img.gz 镜像"; exit 1; }
+          for f in "${files[@]}"; do
+            sz="$(stat -c %s "$f")"
+            [ "$sz" -le 2147483648 ] || { echo "::error::$(basename "$f") 超过 2GiB 限制 ($sz)"; exit 1; }
+          done
+          echo "将上传 ${#files[@]} 个文件:"; printf '  - %s\n' "${files[@]##*/}"
+
+          retry() { local n; for n in 1 2 3; do "$@" && return 0; echo "[WARN] 第 $n 次失败，10 秒后重试: $*"; sleep 10; done; return 1; }
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "[INFO] Release $TAG 已存在（可能是上次失败留下的），改为补传并覆盖同名资产"
+            retry gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            extra=(); [ "$PRE" = "--prerelease" ] && extra+=(--prerelease)
+            retry gh release create "$TAG" "${files[@]}" --title "$TITLE" --generate-notes "${extra[@]}"
+          fi
+          echo "[OK] Release 已发布: $TAG"
+          __PACK_EOF__
+
+      - name: Validate inputs
+        shell: bash
+        env:
+          IN_RUN: ${{ inputs.run_id }}
+          IN_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$IN_RUN" | grep -Eq '^[0-9]{5,}$' || { echo "::error::run_id 必须是纯数字"; exit 1; }
+          if [ -n "$IN_TAG" ] && ! printf '%s' "$IN_TAG" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "::error::tag 只能包含字母数字 . _ -"; exit 1
+          fi
+
+      - name: Download firmware artifact from that run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl assets
+          gh run download "$RUN_ID" -D dl -p 'istoreos-*-x86_64-bypass'
+          find dl -type f | sort
+          # 不论 gh 是否按工件名建子目录，都统一摊平到 assets/
+          find dl -type f -exec cp -f {} assets/ \;
+          ls -la assets
+          [ -n "$(ls assets/*.img.gz 2>/dev/null)" ] || { echo "::error::该运行的工件里没有 .img.gz（工件可能已过期，保留期 14 天）"; exit 1; }
+
+      - name: Verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s assets/sha256sums.txt ]; then
+            (cd assets && sha256sum -c sha256sums.txt)
+          else
+            echo "[WARN] 没有 sha256sums.txt，跳过校验"
+          fi
+
+      - name: Resolve tag and title
+        shell: bash
+        env:
+          IN_TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          branch="$(sed -n 's/^Branch=//p' assets/build-info.txt 2>/dev/null | head -n 1)"
+          num="$(sed -n 's/^WorkflowRun=.*#//p' assets/build-info.txt 2>/dev/null | head -n 1)"
+          ver="${branch#istoreos-}"; ver="${ver:-unknown}"; num="${num:-$RUN_ID}"
+          tag="${IN_TAG:-istoreos-${ver}-x86_64-${num}}"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=iStoreOS ${ver} x86_64 bypass #${num}" >> "$GITHUB_ENV"
+          echo "tag=$tag"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PRE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flag=''; [ "$PRE" = 'true' ] && flag='--prerelease'
+          bash scripts/publish-release.sh assets "$RELEASE_TAG" "$RELEASE_NAME" $flag
